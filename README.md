@@ -170,6 +170,18 @@ ffmpeg -version
 * macOS: `brew install ffmpeg`
 * Ubuntu/Debian: `sudo apt install ffmpeg`
 
+## WebDAV 同步
+
+Web 设置里新增了 **下载时同步到 WebDAV** 开关。开启并填写 WebDAV 地址、用户名、密码和远端目录后，点击“保存到本地目录”或“浏览器下载”时，会把音乐文件同时上传到 WebDAV。密码保存在服务端 `data/settings.db`，Web 设置接口不会回显密码。
+
+仓库提供本地 Docker WebDAV 测试配置，使用 `127.0.0.1`，不需要域名：
+
+```bash
+docker compose -f docker-compose.webdav.yml up -d
+```
+
+测试地址为 `http://127.0.0.1:18081/dav`，用户名 `test`，密码 `123456`。上传目录会映射到本仓库的 `data/webdav`。
+
 ### Docker / Release 包里的 FFmpeg 与 ffprobe
 
 `ffprobe` 属于 FFmpeg 工具集，主要用于本地音乐的时长、码率和标签探测；`ffmpeg` 主要用于非 MP3 音频的封面/歌词元数据写入。缺少它们不会影响程序启动，也不会阻塞本地音乐列表加载，只会降级相关增强能力。

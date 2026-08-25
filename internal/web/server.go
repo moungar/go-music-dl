@@ -105,6 +105,12 @@ func setDownloadHeader(c *gin.Context, filename string) {
 	c.Header("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s\"; filename*=UTF-8''%s", fallback, encoded))
 }
 
+func publicWebSettings() core.WebSettings {
+	settings := core.GetWebSettings()
+	settings.WebDAVPassword = ""
+	return settings
+}
+
 func asciiDownloadFilenameFallback(filename string) string {
 	filename = strings.TrimSpace(filename)
 	if filename == "" {
@@ -449,7 +455,7 @@ func StartWithOptions(port string, opts StartOptions) {
 	})
 
 	api.GET("/settings", func(c *gin.Context) {
-		c.JSON(200, core.GetWebSettings())
+		c.JSON(200, publicWebSettings())
 	})
 	configAPI.POST("/settings", func(c *gin.Context) {
 		var req core.WebSettings
@@ -461,7 +467,7 @@ func StartWithOptions(port string, opts StartOptions) {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 			return
 		}
-		c.JSON(200, core.GetWebSettings())
+		c.JSON(200, publicWebSettings())
 	})
 
 	RegisterMusicRoutes(api, configAPI)

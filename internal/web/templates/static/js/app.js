@@ -39,6 +39,11 @@ let webSettings = {
   downloadToLocal: true,
   downloadDir: "data/downloads",
   downloadFilenameTemplate: "{name} - {artist}",
+  webdavEnabled: false,
+  webdavUrl: "",
+  webdavUsername: "",
+  webdavPassword: "",
+  webdavDir: "music-dl",
   disableFloatingLyrics: false,
   webPageSize: DEFAULT_WEB_PAGE_SIZE,
   cliPageSize: DEFAULT_CLI_PAGE_SIZE,
@@ -60,6 +65,11 @@ function normalizeWebSettings(raw) {
     downloadToLocal: true,
     downloadDir: "data/downloads",
     downloadFilenameTemplate: "{name} - {artist}",
+    webdavEnabled: false,
+    webdavUrl: "",
+    webdavUsername: "",
+    webdavPassword: "",
+    webdavDir: "music-dl",
     disableFloatingLyrics: false,
     webPageSize: DEFAULT_WEB_PAGE_SIZE,
     cliPageSize: DEFAULT_CLI_PAGE_SIZE,
@@ -90,6 +100,24 @@ function normalizeWebSettings(raw) {
     raw.downloadFilenameTemplate.trim() !== ""
   ) {
     next.downloadFilenameTemplate = raw.downloadFilenameTemplate.trim();
+  }
+  if (typeof raw.webdavEnabled === "boolean") {
+    next.webdavEnabled = raw.webdavEnabled;
+  }
+  if (typeof raw.webdavUrl === "string" && raw.webdavUrl.trim() !== "") {
+    next.webdavUrl = raw.webdavUrl.trim();
+  }
+  if (
+    typeof raw.webdavUsername === "string" &&
+    raw.webdavUsername.trim() !== ""
+  ) {
+    next.webdavUsername = raw.webdavUsername.trim();
+  }
+  if (typeof raw.webdavPassword === "string") {
+    next.webdavPassword = raw.webdavPassword;
+  }
+  if (typeof raw.webdavDir === "string" && raw.webdavDir.trim() !== "") {
+    next.webdavDir = raw.webdavDir.trim().replace(/^\/+|\/+$/g, "");
   }
   if (typeof raw.disableFloatingLyrics === "boolean") {
     next.disableFloatingLyrics = raw.disableFloatingLyrics;
@@ -166,6 +194,23 @@ function applyVideoGenFeatureVisibility() {
     const element = document.getElementById(elementId);
     if (!element) return;
     element.style.display = webSettings[key] ? "flex" : "none";
+  });
+}
+
+function syncWebDAVVisibility() {
+  const fields = document.getElementById("webdav-settings-fields");
+  if (fields) {
+    fields.style.display = webSettings.webdavEnabled ? "block" : "none";
+  }
+}
+
+function bindWebDAVSettingEvents() {
+  const toggle = document.getElementById("setting-webdav-enabled");
+  if (!toggle || toggle.dataset.bound === "1") return;
+  toggle.dataset.bound = "1";
+  toggle.addEventListener("change", () => {
+    const fields = document.getElementById("webdav-settings-fields");
+    if (fields) fields.style.display = toggle.checked ? "block" : "none";
   });
 }
 
@@ -249,6 +294,35 @@ function applyWebSettings(settings) {
   if (embedToggle) {
     embedToggle.checked = webSettings.embedDownload;
   }
+
+  const webdavEnabledToggle = document.getElementById(
+    "setting-webdav-enabled",
+  );
+  if (webdavEnabledToggle) {
+    webdavEnabledToggle.checked = webSettings.webdavEnabled;
+  }
+  const webdavUrlInput = document.getElementById("setting-webdav-url");
+  if (webdavUrlInput) {
+    webdavUrlInput.value = webSettings.webdavUrl;
+  }
+  const webdavUsernameInput = document.getElementById(
+    "setting-webdav-username",
+  );
+  if (webdavUsernameInput) {
+    webdavUsernameInput.value = webSettings.webdavUsername;
+  }
+  const webdavPasswordInput = document.getElementById(
+    "setting-webdav-password",
+  );
+  if (webdavPasswordInput) {
+    webdavPasswordInput.value = webSettings.webdavPassword;
+  }
+  const webdavDirInput = document.getElementById("setting-webdav-dir");
+  if (webdavDirInput) {
+    webdavDirInput.value = webSettings.webdavDir;
+  }
+  bindWebDAVSettingEvents();
+  syncWebDAVVisibility();
 
   const dirInput = document.getElementById("setting-download-dir");
   if (dirInput) {
@@ -787,10 +861,16 @@ async function handleDownloadClick(link) {
   try {
     const data = await requestLocalDownload(link.href);
     let message = data.path || webSettings.downloadDir;
+    let warning = false;
     if (data.warning) {
       message += `\n提示: ${data.warning}`;
+      warning = true;
     }
-    showToast("下载完成", message, data.warning ? "warning" : "success", 0);
+    if (data.webdav_error) {
+      message += `\nWebDAV: ${data.webdav_error}`;
+      warning = true;
+    }
+    showToast("下载完成", message, warning ? "warning" : "success", 0);
     return true;
   } catch (error) {
     showToast("下载失败", error.message || "下载失败", "error", 0);
@@ -3748,6 +3828,14 @@ async function saveCookies() {
     downloadFilenameTemplate:
       document.getElementById("setting-download-filename-template")?.value ||
       "",
+    webdavEnabled: !!document.getElementById("setting-webdav-enabled")
+      ?.checked,
+    webdavUrl: document.getElementById("setting-webdav-url")?.value || "",
+    webdavUsername:
+      document.getElementById("setting-webdav-username")?.value || "",
+    webdavPassword:
+      document.getElementById("setting-webdav-password")?.value || "",
+    webdavDir: document.getElementById("setting-webdav-dir")?.value || "",
     disableFloatingLyrics: !document.getElementById("setting-floating-lyrics")
       ?.checked,
     webPageSize: parsePositiveInt(
@@ -4832,12 +4920,147 @@ const ap = new APlayer({
 
 window.ap = ap;
 
+const PLAYER_SPEEDS = Object.freeze([
+  0.5, 0.75, 1, 1.25, 1.5, 1.75, 2, 2.25, 2.5, 2.75, 3,
+]);
+let playerSpeed = (() => {
+  const saved = Number(localStorage.getItem("musicdl:playbackRate"));
+  return PLAYER_SPEEDS.includes(saved) ? saved : 1;
+})();
+
+window.PLAYER_SPEEDS = PLAYER_SPEEDS;
+window.playerSpeed = playerSpeed;
+window.getPlayerPlaybackRate = () => playerSpeed;
+
+function applyPlayerPlaybackRate(rate) {
+  if (!ap?.audio) return;
+  const normalized = Number(rate) || 1;
+  ap.audio.playbackRate = normalized;
+  if (window.VideoGen?.isLocalAudio && window.VideoGen?.localAudio) {
+    window.VideoGen.localAudio.playbackRate = normalized;
+  }
+  const btn = document.querySelector(".player-speed-btn");
+  if (btn) btn.textContent = `${normalized}x`;
+  document.querySelectorAll(".player-speed-option").forEach((option) => {
+    option.classList.toggle(
+      "active",
+      Number(option.dataset.rate) === normalized,
+    );
+  });
+  const vgBtn = document.getElementById("vg-speed-button");
+  if (vgBtn) vgBtn.textContent = `${normalized}x`;
+  document.querySelectorAll("#vg-speed-menu .vg-speed-option").forEach(
+    (option) => {
+      option.classList.toggle(
+        "active",
+        Number(option.dataset.rate) === normalized,
+      );
+    },
+  );
+  syncMediaSession();
+}
+
+function setPlayerPlaybackRate(rate) {
+  const normalized = Number(rate);
+  if (!PLAYER_SPEEDS.includes(normalized)) return;
+  playerSpeed = normalized;
+  window.playerSpeed = normalized;
+  localStorage.setItem("musicdl:playbackRate", String(normalized));
+  if (window.VideoGen) {
+    window.VideoGen.playbackRate = normalized;
+  }
+  applyPlayerPlaybackRate(normalized);
+}
+
+window.setPlayerPlaybackRate = setPlayerPlaybackRate;
+window.applyPlayerPlaybackRate = applyPlayerPlaybackRate;
+
+(function initPlayerSpeedControl() {
+  let attempts = 0;
+
+  function tryInject() {
+    attempts++;
+    if (attempts > 30) return;
+
+    const apFixed = document.querySelector(".aplayer.aplayer-fixed");
+    if (!apFixed) {
+      setTimeout(tryInject, 100);
+      return;
+    }
+    if (document.querySelector(".player-speed-wrap")) return;
+
+    const wrap = document.createElement("div");
+    wrap.className = "player-speed-wrap";
+
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "player-speed-btn";
+    button.textContent = `${playerSpeed}x`;
+    button.title = "播放速度";
+    button.setAttribute("aria-label", "播放速度");
+    button.setAttribute("aria-haspopup", "true");
+    button.setAttribute("aria-expanded", "false");
+
+    const menu = document.createElement("div");
+    menu.className = "player-speed-menu";
+    menu.hidden = true;
+    menu.innerHTML = PLAYER_SPEEDS.map(
+      (rate) =>
+        `<button type="button" class="player-speed-option${
+          rate === playerSpeed ? " active" : ""
+        }" data-rate="${rate}">${rate}x</button>`,
+    ).join("");
+
+    button.addEventListener("click", (event) => {
+      event.stopPropagation();
+      const nextHidden = !menu.hidden;
+      menu.hidden = nextHidden;
+      button.setAttribute("aria-expanded", String(!nextHidden));
+    });
+
+    menu.addEventListener("click", (event) => {
+      event.stopPropagation();
+      const option = event.target.closest(".player-speed-option");
+      if (!option) return;
+      setPlayerPlaybackRate(Number(option.dataset.rate));
+      menu.hidden = true;
+      button.setAttribute("aria-expanded", "false");
+    });
+
+    document.addEventListener("click", (event) => {
+      if (!wrap.contains(event.target)) {
+        menu.hidden = true;
+        button.setAttribute("aria-expanded", "false");
+      }
+    });
+
+    document.addEventListener("keydown", (event) => {
+      if (event.key === "Escape" && !menu.hidden) {
+        menu.hidden = true;
+        button.setAttribute("aria-expanded", "false");
+      }
+    });
+
+    wrap.append(button, menu);
+    apFixed.appendChild(wrap);
+    applyPlayerPlaybackRate(playerSpeed);
+  }
+
+  setTimeout(tryInject, 100);
+})();
+
+applyPlayerPlaybackRate(playerSpeed);
+
 setupMediaSession();
 ap.audio.addEventListener("timeupdate", () => KaraokeLyrics.update());
 ap.audio.addEventListener("seeked", () => KaraokeLyrics.update());
-ap.audio.addEventListener("loadedmetadata", () =>
-  KaraokeLyrics.load(getCurrentAPlayerAudio()),
-);
+ap.audio.addEventListener("loadedmetadata", () => {
+  KaraokeLyrics.load(getCurrentAPlayerAudio());
+  applyPlayerPlaybackRate(playerSpeed);
+});
+ap.audio.addEventListener("emptied", () => {
+  applyPlayerPlaybackRate(playerSpeed);
+});
 ap.audio.addEventListener("play", () =>
   KaraokeLyrics.handlePlayStateChange(true),
 );
@@ -4956,6 +5179,7 @@ setTimeout(() => {
 
 ap.on("listswitch", (e) => {
   const index = e.index;
+  applyPlayerPlaybackRate(playerSpeed);
   const newAudio = ap.list.audios[index];
   const playbackCardID = getPlaybackCardID(newAudio);
   if (playbackCardID) {
@@ -4996,6 +5220,7 @@ ap.on("listswitch", (e) => {
 });
 
 ap.on("play", () => {
+  applyPlayerPlaybackRate(playerSpeed);
   const idx = ap?.list?.index;
   const audio = typeof idx === "number" ? ap.list.audios[idx] : null;
   rememberPlaybackHistory(audio);
@@ -5923,7 +6148,7 @@ async function batchDownload() {
           skipped++;
         } else {
           success++;
-          if (result && result.warning) {
+          if (result && (result.warning || result.webdav_error)) {
             warningCount++;
           }
         }
