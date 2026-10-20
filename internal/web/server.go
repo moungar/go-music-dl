@@ -1,11 +1,13 @@
 package web
 
 import (
+	"context"
 	"embed"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"html/template"
+	"io/fs"
 	"net"
 	"net/http"
 	"net/url"
@@ -103,6 +105,27 @@ func setDownloadHeader(c *gin.Context, filename string) {
 	encoded := url.PathEscape(filename)
 	fallback := asciiDownloadFilenameFallback(filename)
 	c.Header("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s\"; filename*=UTF-8''%s", fallback, encoded))
+}
+
+func publicWebSettings() core.WebSettings {
+	settings := core.GetWebSettings()
+	settings.WebDAVPassword = ""
+	// 签名服务 token 等同取流能力，不回显到页面（留空保存时保留旧值）。
+	settings.SodaSignerToken = ""
+	return settings
+}
+
+// webSettingsPayload 在公开设置上追加运行时状态（不落库）：本机签名器是否可用。
+type webSettingsPayload struct {
+	core.WebSettings
+	SodaLocalSignerAvailable bool `json:"sodaLocalSignerAvailable"`
+}
+
+func publicWebSettingsPayload() webSettingsPayload {
+	return webSettingsPayload{
+		WebSettings:              publicWebSettings(),
+		SodaLocalSignerAvailable: core.LocalSodaSignerAvailable(),
+	}
 }
 
 func asciiDownloadFilenameFallback(filename string) string {
@@ -203,6 +226,142 @@ func playlistDetailURL(root string, searchType string, playlist model.Playlist) 
 	return fmt.Sprintf("%s/%s?%s", root, route, values.Encode())
 }
 
+func isDetailPagePath(requestPath string) bool {
+	requestPath = strings.TrimRight(strings.TrimSpace(requestPath), "/")
+	return strings.HasSuffix(requestPath, "/playlist") ||
+		strings.HasSuffix(requestPath, "/album") ||
+		strings.HasSuffix(requestPath, "/collection")
+}
+
+type cookieCaptureHint struct {
+	LoginURL string
+	Domain   string
+	Hint     string
+}
+
+func cookieCaptureHints() map[string]cookieCaptureHint {
+	return map[string]cookieCaptureHint{
+		"netease": {
+			LoginURL: "https://music.163.com",
+			Domain:   "music.163.com",
+			Hint:     "登录后打开任意歌曲或歌单页面，筛选同域请求。",
+		},
+		"qq": {
+			LoginURL: "https://y.qq.com",
+			Domain:   "u.y.qq.com",
+			Hint:     "登录并播放一首歌后筛选该域请求；也可使用右侧 QQ / 微信扫码登录。",
+		},
+		"kugou": {
+			LoginURL: "https://www.kugou.com",
+			Domain:   "www.kugou.com",
+			Hint:     "登录后打开任意歌单或播放页，筛选 /api/ 请求。",
+		},
+		"kuwo": {
+			LoginURL: "https://www.kuwo.cn",
+			Domain:   "www.kuwo.cn",
+			Hint:     "登录并播放一首歌，筛选同域请求。",
+		},
+		"migu": {
+			LoginURL: "https://music.migu.cn",
+			Domain:   "music.migu.cn",
+			Hint:     "登录并播放一首歌，筛选同域的音乐接口请求。",
+		},
+		"fivesing": {
+			LoginURL: "https://5sing.kugou.com",
+			Domain:   "5sing.kugou.com",
+			Hint:     "登录后打开歌曲或歌单页面，筛选同域请求。",
+		},
+		"jamendo": {
+			LoginURL: "https://www.jamendo.com",
+			Domain:   "www.jamendo.com",
+			Hint:     "普通试听通常不需要 Cookie；需要账号态时登录后筛选同域请求。",
+		},
+		"joox": {
+			LoginURL: "https://www.joox.com",
+			Domain:   "www.joox.com",
+			Hint:     "登录并播放一首歌，筛选同域请求。",
+		},
+		"qianqian": {
+			LoginURL: "https://music.taihe.com",
+			Domain:   "music.taihe.com",
+			Hint:     "登录并播放一首歌，筛选同域请求。",
+		},
+		"soda": {
+			LoginURL: "https://www.qishui.com",
+			Domain:   "api.qishui.com",
+			Hint:     "登录并播放一首歌，筛选 api.qishui.com/luna/ 请求；扫码登录成功后也会自动保存 Cookie。",
+		},
+		"bilibili": {
+			LoginURL: "https://www.bilibili.com",
+			Domain:   "api.bilibili.com",
+			Hint:     "登录并播放任意视频或音频，筛选该域请求；Cookie 中通常包含 SESSDATA。",
+		},
+		"apple": {
+			LoginURL: "https://music.apple.com",
+			Domain:   "amp-api.music.apple.com",
+			Hint:     "登录后播放一首歌并刷新页面，筛选该域请求；Cookie 中至少应包含 media-user-token。",
+		},
+	}
+}
+
+const shortPreviewFilterSeconds = 60
+
+func splitVersionFilterKeywords(raw string) []string {
+	seen := make(map[string]struct{})
+	keywords := make([]string, 0)
+	for _, value := range strings.FieldsFunc(raw, func(r rune) bool {
+		switch r {
+		case ',', '，', ';', '；', '\n', '\r':
+			return true
+		default:
+			return false
+		}
+	}) {
+		value = strings.ToLower(strings.TrimSpace(value))
+		if value == "" {
+			continue
+		}
+		if _, exists := seen[value]; exists {
+			continue
+		}
+		seen[value] = struct{}{}
+		keywords = append(keywords, value)
+	}
+	return keywords
+}
+
+func filterSongsForDisplay(songs []model.Song, settings core.WebSettings) []model.Song {
+	if len(songs) == 0 {
+		return songs
+	}
+	keywords := splitVersionFilterKeywords(settings.VersionFilterKeywords)
+	if !settings.FilterVersionKeywords && !settings.FilterShortTracks {
+		return songs
+	}
+
+	filtered := make([]model.Song, 0, len(songs))
+	for _, song := range songs {
+		if settings.FilterShortTracks && song.Duration > 0 && song.Duration < shortPreviewFilterSeconds {
+			continue
+		}
+		if settings.FilterVersionKeywords && len(keywords) > 0 {
+			name := strings.ToLower(song.Name)
+			blocked := false
+			for _, keyword := range keywords {
+				if strings.Contains(name, keyword) {
+					blocked = true
+					break
+				}
+			}
+			if blocked {
+				continue
+			}
+		}
+		filtered = append(filtered, song)
+	}
+	return filtered
+}
+
 func renderIndex(c *gin.Context, songs []model.Song, playlists []model.Playlist, q string, selected []string, errMsg string, searchType string, playlistLink string, colID string, colName string, isLocalColPage bool, collectionKind string, importCollection *importCollectionMeta) {
 	allSrc := core.GetAllSourceNames()
 	desc := make(map[string]string)
@@ -225,6 +384,10 @@ func renderIndex(c *gin.Context, songs []model.Song, playlists []model.Playlist,
 	for _, s := range core.GetPlaylistCategorySourceNames() {
 		playlistCategorySupported[s] = true
 	}
+	topListSupported := make(map[string]bool)
+	for _, s := range core.GetTopListSourceNames() {
+		topListSupported[s] = true
+	}
 	qrLoginSupported := make(map[string]bool)
 	for _, s := range core.GetQRLoginSourceNames() {
 		qrLoginSupported[s] = true
@@ -237,8 +400,11 @@ func renderIndex(c *gin.Context, songs []model.Song, playlists []model.Playlist,
 	playlistCategorySources, _ := c.Get("PlaylistCategorySources")
 	playlistCategoryCurrent, _ := c.Get("PlaylistCategoryCurrent")
 	playlistSourceTabs, _ := c.Get("PlaylistSourceTabs")
+	topListSources, _ := c.Get("TopListSources")
+	topListCurrent, _ := c.Get("TopListCurrent")
 
 	settings := core.GetWebSettings()
+	songs = filterSongsForDisplay(songs, settings)
 	defaultPageSize := settings.WebPageSize
 	if defaultPageSize <= 0 {
 		defaultPageSize = core.DefaultWebPageSize
@@ -309,12 +475,15 @@ func renderIndex(c *gin.Context, songs []model.Song, playlists []model.Playlist,
 		"AllSources":              allSrc,
 		"DefaultSources":          defaultSourcesForSearchType(searchType),
 		"SourceDescriptions":      desc,
+		"CookieCaptureHints":      cookieCaptureHints(),
 		"Selected":                selected,
 		"Error":                   errMsg,
 		"SearchType":              searchType,
+		"ShowDetailBack":          isDetailPagePath(c.Request.URL.Path),
 		"PlaylistSupported":       playlistSupported,
 		"AlbumSupported":          albumSupported,
 		"CategorySupported":       playlistCategorySupported,
+		"TopListSupported":        topListSupported,
 		"QRLoginSupported":        qrLoginSupported,
 		"SearchPlaceholder":       searchPlaceholderForType(searchType),
 		"CollectionLabel":         collectionLabelForSearchType(searchType),
@@ -324,12 +493,15 @@ func renderIndex(c *gin.Context, songs []model.Song, playlists []model.Playlist,
 		"ColID":                   colID,
 		"ColName":                 colName,
 		"CollectionKind":          collectionKind,
+		"CollectionContentType":   c.GetString("CollectionContentType"),
 		"ImportCollection":        importCollection,
 		"CanRemoveSongs":          colID != "" && collectionKind == collectionKindManual,
 		"IsLocalColPage":          isLocalColPage,
 		"PlaylistCategorySources": playlistCategorySources,
 		"PlaylistCategoryCurrent": playlistCategoryCurrent,
 		"PlaylistSourceTabs":      playlistSourceTabs,
+		"TopListSources":          topListSources,
+		"TopListCurrent":          topListCurrent,
 		"UserPlaylistSupported":   userPlaylistSupported,
 	})
 }
@@ -377,11 +549,13 @@ func StartWithOptions(port string, opts StartOptions) {
 	}
 	InitDB()
 	defer CloseDB()
-	syncLocalMusicIndexAsync()
+	// Local music is indexed on demand. Scanning the configured download
+	// directory at startup is expensive on Android, especially when the user
+	// points it at a large shared-storage directory.
 
 	gin.SetMode(gin.ReleaseMode)
 	r := gin.Default()
-	r.Use(corsMiddleware())
+	r.Use(corsMiddleware(), gzipMiddleware())
 
 	tmpl := template.Must(template.New("").Funcs(template.FuncMap{
 		"artistTokens":       splitArtistTokens,
@@ -426,6 +600,11 @@ func StartWithOptions(port string, opts StartOptions) {
 	api.GET("/videogen.css", func(c *gin.Context) { c.FileFromFS("templates/static/css/videogen.css", http.FS(templateFS)) })
 	api.GET("/videogen.js", func(c *gin.Context) { c.FileFromFS("templates/static/js/videogen.js", http.FS(templateFS)) })
 	api.GET("/app.js", func(c *gin.Context) { c.FileFromFS("templates/static/js/app.js", http.FS(templateFS)) })
+	vendorAssets, err := embeddedVendorFS()
+	if err != nil {
+		panic(fmt.Sprintf("load embedded vendor assets: %v", err))
+	}
+	api.StaticFS("/vendor", http.FS(vendorAssets))
 	configAPI := bindAuthMiddleware(api, opts)
 	api.Static("/videos", videoDir)
 
@@ -449,7 +628,7 @@ func StartWithOptions(port string, opts StartOptions) {
 	})
 
 	api.GET("/settings", func(c *gin.Context) {
-		c.JSON(200, core.GetWebSettings())
+		c.JSON(200, publicWebSettingsPayload())
 	})
 	configAPI.POST("/settings", func(c *gin.Context) {
 		var req core.WebSettings
@@ -458,10 +637,14 @@ func StartWithOptions(port string, opts StartOptions) {
 			return
 		}
 		if err := core.SaveWebSettings(req); err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			status := http.StatusInternalServerError
+			if errors.Is(err, core.ErrInvalidWebSettings) {
+				status = http.StatusBadRequest
+			}
+			c.JSON(status, gin.H{"error": err.Error()})
 			return
 		}
-		c.JSON(200, core.GetWebSettings())
+		c.JSON(200, publicWebSettingsPayload())
 	})
 
 	RegisterMusicRoutes(api, configAPI)
@@ -471,6 +654,13 @@ func StartWithOptions(port string, opts StartOptions) {
 	RegisterVideogenRoutes(api, videoDir)
 	RegisterUpdateRoutes(api)
 
+	queue, err := core.OpenDownloadQueue()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Initialize download queue: %v\n", err)
+		return
+	}
+	RegisterDownloadQueueRoutes(api, queue)
+
 	listenAddr := opts.ListenHost + ":" + port
 	listener, err := net.Listen("tcp", listenAddr)
 	if err != nil {
@@ -479,6 +669,14 @@ func StartWithOptions(port string, opts StartOptions) {
 			return
 		}
 		fmt.Fprintf(os.Stderr, "Failed to start web server on %s: %v\n", listenAddr, err)
+		return
+	}
+
+	queueContext, stopQueue := context.WithCancel(context.Background())
+	defer stopQueue()
+	if err := queue.Start(queueContext, processQueuedDownload); err != nil {
+		_ = listener.Close()
+		fmt.Fprintf(os.Stderr, "Start download queue: %v\n", err)
 		return
 	}
 
@@ -494,6 +692,10 @@ func StartWithOptions(port string, opts StartOptions) {
 	if err := http.Serve(listener, r); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		fmt.Fprintf(os.Stderr, "Web server stopped with error: %v\n", err)
 	}
+}
+
+func embeddedVendorFS() (fs.FS, error) {
+	return fs.Sub(templateFS, "templates/static/vendor")
 }
 
 func bindAuthMiddleware(api *gin.RouterGroup, opts StartOptions) *gin.RouterGroup {

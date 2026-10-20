@@ -12,16 +12,20 @@ import (
 
 const (
 	androidR          = 30
+	androidT          = 33
 	storageRequestID  = 1001
+	notificationReqID = 1002
 	permissionGranted = 0
 
 	readExternalStorage  = "android.permission.READ_EXTERNAL_STORAGE"
 	writeExternalStorage = "android.permission.WRITE_EXTERNAL_STORAGE"
+	postNotifications    = "android.permission.POST_NOTIFICATIONS"
 )
 
 var (
-	playbackWakeLockMu sync.Mutex
-	playbackWakeLock   jni.Object
+	playbackServiceMu      sync.Mutex
+	playbackServiceContext jni.Object
+	playbackServiceStarted bool
 )
 
 func (a *desktopApp) requestStoragePermission(evt app.ViewEvent) {
@@ -39,8 +43,8 @@ func (a *desktopApp) requestStoragePermission(evt app.ViewEvent) {
 		if err := requestStoragePermissionFromView(view); err != nil {
 			log.Printf("request storage permission: %v", err)
 		}
-		if err := initPlaybackWakeLockFromView(view); err != nil {
-			log.Printf("init playback wake lock: %v", err)
+		if err := initPlaybackServiceFromView(view); err != nil {
+			log.Printf("init playback service: %v", err)
 		}
 	})
 }
@@ -57,6 +61,26 @@ func requestStoragePermissionFromView(view jni.Object) error {
 		}
 		return requestLegacyStorage(env, activity)
 	})
+}
+
+func requestNotificationPermission(env jni.Env, activity jni.Object) error {
+	if androidSDK(env) < androidT || hasPermission(env, activity, postNotifications) {
+		return nil
+	}
+
+	stringClass := jni.FindClass(env, "java/lang/String")
+	permissions := jni.NewObjectArray(env, 1, stringClass, 0)
+	if err := jni.SetObjectArrayElement(env, permissions, 0, jni.Object(jni.JavaString(env, postNotifications))); err != nil {
+		return err
+	}
+	activityClass := jni.GetObjectClass(env, activity)
+	return jni.CallVoidMethod(
+		env,
+		activity,
+		jni.GetMethodID(env, activityClass, "requestPermissions", "([Ljava/lang/String;I)V"),
+		jni.Value(permissions),
+		jni.Value(notificationReqID),
+	)
 }
 
 func activityFromView(env jni.Env, view jni.Object) (jni.Object, error) {
@@ -152,77 +176,183 @@ func startActivity(env jni.Env, activity, intent jni.Object) error {
 	)
 }
 
-func initPlaybackWakeLockFromView(view jni.Object) error {
+func initPlaybackServiceFromView(view jni.Object) error {
 	return jni.Do(jni.JVMFor(app.JavaVM()), func(env jni.Env) error {
 		activity, err := activityFromView(env, view)
 		if err != nil {
 			return err
 		}
 
-		contextClass := jni.FindClass(env, "android/content/Context")
-		powerService := jni.GetStaticObjectField(env, contextClass, jni.GetStaticFieldID(env, contextClass, "POWER_SERVICE", "Ljava/lang/String;"))
-		powerManager, err := jni.CallObjectMethod(
-			env,
-			activity,
-			jni.GetMethodID(env, jni.GetObjectClass(env, activity), "getSystemService", "(Ljava/lang/String;)Ljava/lang/Object;"),
-			jni.Value(powerService),
-		)
-		if err != nil {
-			return err
+		playbackServiceMu.Lock()
+		if playbackServiceContext != 0 {
+			jni.DeleteGlobalRef(env, playbackServiceContext)
 		}
-
-		powerManagerClass := jni.FindClass(env, "android/os/PowerManager")
-		partialWakeLock := jni.GetStaticIntField(env, powerManagerClass, jni.GetStaticFieldID(env, powerManagerClass, "PARTIAL_WAKE_LOCK", "I"))
-		wakeLock, err := jni.CallObjectMethod(
-			env,
-			powerManager,
-			jni.GetMethodID(env, powerManagerClass, "newWakeLock", "(ILjava/lang/String;)Landroid/os/PowerManager$WakeLock;"),
-			jni.Value(partialWakeLock),
-			jni.Value(jni.JavaString(env, "music-dl:playback")),
-		)
-		if err != nil {
-			return err
-		}
-
-		globalWakeLock := jni.NewGlobalRef(env, wakeLock)
-		playbackWakeLockMu.Lock()
-		if playbackWakeLock != 0 {
-			jni.DeleteGlobalRef(env, playbackWakeLock)
-		}
-		playbackWakeLock = globalWakeLock
-		playbackWakeLockMu.Unlock()
+		playbackServiceContext = jni.NewGlobalRef(env, activity)
+		playbackServiceMu.Unlock()
 		return nil
 	})
 }
 
 func (a *desktopApp) setPlaybackWakeLock(hold bool) {
 	a.window.Run(func() {
-		if err := setPlaybackWakeLockHeld(hold); err != nil {
-			log.Printf("set playback wake lock %v: %v", hold, err)
+		if hold {
+			if err := requestNotificationPermissionForPlayback(); err != nil {
+				log.Printf("request notification permission: %v", err)
+			}
+		}
+		if err := setPlaybackForegroundService(hold); err != nil {
+			log.Printf("set playback foreground service %v: %v", hold, err)
 		}
 	})
 }
 
-func setPlaybackWakeLockHeld(hold bool) error {
+func (a *desktopApp) updatePlaybackPlatform(state string) {
+	switch state {
+	case "playing":
+		playbackServiceMu.Lock()
+		serviceReady := playbackServiceContext != 0
+		serviceStarted := playbackServiceStarted
+		playbackServiceMu.Unlock()
+		if !serviceReady {
+			// The first ViewEvent setup may still be pending. Serialize this
+			// uncommon early-start path with the existing Gio initialization.
+			a.setPlaybackWakeLock(true)
+		} else if serviceStarted {
+			// Auto-advance emits "ended" and then "playing" while the Gio
+			// window may already be stopped. The foreground service owns the
+			// CPU wake lock while playback is active.
+		} else {
+			// Start while the media event is still recent. Waiting for another
+			// Gio frame can let Android classify the app as backgrounded and
+			// reject a media-playback foreground service on Android 12+.
+			if err := setPlaybackForegroundService(true); err != nil {
+				log.Printf("start playback foreground service: %v", err)
+			}
+			a.window.Run(func() {
+				if err := requestNotificationPermissionForPlayback(); err != nil {
+					log.Printf("request notification permission: %v", err)
+				}
+			})
+		}
+		if err := updatePlaybackServiceInfo(a.playbackMetadata, true); err != nil {
+			log.Printf("update playing media session: %v", err)
+		}
+	case "paused":
+		if err := updatePlaybackServiceInfo(a.playbackMetadata, false); err != nil {
+			log.Printf("update paused media session: %v", err)
+		}
+	case "released":
+		if err := setPlaybackForegroundService(false); err != nil {
+			log.Printf("stop playback foreground service: %v", err)
+		}
+	}
+}
+
+func (a *desktopApp) updatePlaybackMetadataPlatform() {
+	if err := updatePlaybackServiceInfo(a.playbackMetadata, a.playbackActive); err != nil {
+		log.Printf("update media session metadata: %v", err)
+	}
+}
+
+func (a *desktopApp) stopPlaybackPlatform() {
+	if err := setPlaybackForegroundService(false); err != nil {
+		log.Printf("stop playback foreground service on close: %v", err)
+	}
+}
+
+func requestNotificationPermissionForPlayback() error {
 	return jni.Do(jni.JVMFor(app.JavaVM()), func(env jni.Env) error {
-		playbackWakeLockMu.Lock()
-		wakeLock := playbackWakeLock
-		playbackWakeLockMu.Unlock()
-		if wakeLock == 0 {
+		playbackServiceMu.Lock()
+		context := playbackServiceContext
+		playbackServiceMu.Unlock()
+		if context == 0 {
+			return nil
+		}
+		return requestNotificationPermission(env, context)
+	})
+}
+
+func setPlaybackForegroundService(hold bool) error {
+	return jni.Do(jni.JVMFor(app.JavaVM()), func(env jni.Env) error {
+		playbackServiceMu.Lock()
+		context := playbackServiceContext
+		started := playbackServiceStarted
+		playbackServiceMu.Unlock()
+		if context == 0 || hold == started {
 			return nil
 		}
 
-		wakeLockClass := jni.GetObjectClass(env, wakeLock)
-		held, err := jni.CallBooleanMethod(env, wakeLock, jni.GetMethodID(env, wakeLockClass, "isHeld", "()Z"))
+		if hold {
+			if err := startPlaybackForegroundService(env, context); err != nil {
+				return err
+			}
+		} else if err := stopPlaybackForegroundService(env, context); err != nil {
+			return err
+		}
+
+		playbackServiceMu.Lock()
+		playbackServiceStarted = hold
+		playbackServiceMu.Unlock()
+		return nil
+	})
+}
+
+func startPlaybackForegroundService(env jni.Env, context jni.Object) error {
+	serviceClass, err := loadMusicDLJavaClass(env, context, "org.gioui.MusicDLPlaybackService")
+	if err != nil {
+		return err
+	}
+	start := jni.GetStaticMethodID(env, serviceClass, "startPlayback", "(Landroid/content/Context;)V")
+	return jni.CallStaticVoidMethod(env, serviceClass, start, jni.Value(context))
+}
+
+func stopPlaybackForegroundService(env jni.Env, context jni.Object) error {
+	serviceClass, err := loadMusicDLJavaClass(env, context, "org.gioui.MusicDLPlaybackService")
+	if err != nil {
+		return err
+	}
+	stop := jni.GetStaticMethodID(env, serviceClass, "stopPlayback", "(Landroid/content/Context;)V")
+	return jni.CallStaticVoidMethod(env, serviceClass, stop, jni.Value(context))
+}
+
+func updatePlaybackServiceInfo(metadata playbackMetadata, playing bool) error {
+	return jni.Do(jni.JVMFor(app.JavaVM()), func(env jni.Env) error {
+		playbackServiceMu.Lock()
+		context := playbackServiceContext
+		playbackServiceMu.Unlock()
+		if context == 0 {
+			return nil
+		}
+
+		title := metadata.Title
+		if title == "" {
+			title = "MusicDL"
+		}
+		playingValue := uint64(0)
+		if playing {
+			playingValue = 1
+		}
+		serviceClass, err := loadMusicDLJavaClass(env, context, "org.gioui.MusicDLPlaybackService")
 		if err != nil {
 			return err
 		}
-		if hold == held {
-			return nil
-		}
-		if hold {
-			return jni.CallVoidMethod(env, wakeLock, jni.GetMethodID(env, wakeLockClass, "acquire", "()V"))
-		}
-		return jni.CallVoidMethod(env, wakeLock, jni.GetMethodID(env, wakeLockClass, "release", "()V"))
+		update := jni.GetStaticMethodID(
+			env,
+			serviceClass,
+			"updatePlayback",
+			"(Landroid/content/Context;ZLjava/lang/String;Ljava/lang/String;Ljava/lang/String;JJ)V",
+		)
+		return jni.CallStaticVoidMethod(
+			env,
+			serviceClass,
+			update,
+			jni.Value(context),
+			jni.Value(playingValue),
+			jni.Value(jni.JavaString(env, title)),
+			jni.Value(jni.JavaString(env, metadata.Artist)),
+			jni.Value(jni.JavaString(env, metadata.Album)),
+			jni.Value(uint64(metadata.PositionMS)),
+			jni.Value(uint64(metadata.DurationMS)),
+		)
 	})
 }

@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/guohuiyuan/go-music-dl/core"
 	"github.com/guohuiyuan/music-lib/model"
 	"gorm.io/gorm/clause"
 )
@@ -63,6 +64,81 @@ func localMusicIndexExtra(row *LocalMusicIndex) map[string]string {
 	return extra
 }
 
+func localMusicTrackFromIndexRow(rootAbs string, row *LocalMusicIndex) *localMusicTrack {
+	if row == nil || strings.TrimSpace(row.RelPath) == "" {
+		return nil
+	}
+
+	cover := row.Cover
+	if cover == "" && row.HasCover {
+		cover = RoutePrefix + "/local_music/cover?id=" + url.QueryEscape(row.ID)
+	}
+	return &localMusicTrack{
+		ID:         row.ID,
+		Source:     localMusicSource,
+		Name:       row.Name,
+		Artist:     row.Artist,
+		Album:      row.Album,
+		Cover:      cover,
+		Duration:   row.Duration,
+		Filename:   filepath.Base(row.RelPath),
+		RelPath:    row.RelPath,
+		Ext:        row.Ext,
+		Size:       row.Size,
+		SizeText:   formatSizeForIndex(row.Size),
+		ModifiedAt: row.ModTime,
+		Extra:      localMusicIndexExtra(row),
+		absPath:    filepath.Join(rootAbs, filepath.FromSlash(row.RelPath)),
+		modTime:    row.ModTime,
+	}
+}
+
+// hydrateLocalMusicMetaCacheFromIndex turns persisted index rows into a warm
+// metadata cache. A filesystem refresh still stats files to detect additions,
+// deletions and edits, but unchanged files no longer need tag parsing or a
+// separate ffprobe process.
+func hydrateLocalMusicMetaCacheFromIndex(rootAbs string) {
+	if db == nil || strings.TrimSpace(rootAbs) == "" {
+		return
+	}
+	rootAbs = filepath.Clean(rootAbs)
+	localMusicMetaCacheMu.RLock()
+	alreadyHydrated := localMusicMetaCacheRoot == rootAbs
+	localMusicMetaCacheMu.RUnlock()
+	if alreadyHydrated {
+		return
+	}
+	markHydrated := func() {
+		localMusicMetaCacheMu.Lock()
+		localMusicMetaCacheRoot = rootAbs
+		localMusicMetaCacheMu.Unlock()
+	}
+
+	const batchSize = 500
+	lastID := ""
+	for {
+		var rows []LocalMusicIndex
+		query := db.Order("id ASC").Limit(batchSize)
+		if lastID != "" {
+			query = query.Where("id > ?", lastID)
+		}
+		if err := query.Find(&rows).Error; err != nil {
+			return
+		}
+		for i := range rows {
+			track := localMusicTrackFromIndexRow(rootAbs, &rows[i])
+			if track != nil {
+				cacheLocalMusicTrack(rootAbs, track)
+			}
+		}
+		if len(rows) < batchSize {
+			markHydrated()
+			return
+		}
+		lastID = rows[len(rows)-1].ID
+	}
+}
+
 func localMusicTrackToIndexRow(track *localMusicTrack, scannedAt time.Time) LocalMusicIndex {
 	hasCover := strings.TrimSpace(track.Cover) != ""
 	hasLyric := false
@@ -102,6 +178,11 @@ func syncLocalMusicIndex() error {
 	if err := syncTracksToIndex(tracks); err != nil {
 		return err
 	}
+	// 磁盘是唯一真相：扫完盘顺手对账下载去重索引，把文件已经不在本地的记录回收掉，
+	// 否则用户在 NAS 后台删掉文件后再下载，仍然会被判定为「已下载」而跳过。
+	if exists {
+		reconcileDownloadDedupWithScan(tracks, dir)
+	}
 	storeLocalMusicScanSnapshot(localMusicScanSnapshot{
 		Dir:       dir,
 		Tracks:    cloneLocalMusicTrackSlice(tracks),
@@ -111,11 +192,80 @@ func syncLocalMusicIndex() error {
 	return nil
 }
 
-// syncLocalMusicIndexAsync 在后台跑一次全量同步，不阻塞调用方（启动时用）。
+// syncLocalMusicIndexAsync runs an explicit background rebuild. Normal startup
+// uses the persisted index and defers scanning until local music is opened.
 func syncLocalMusicIndexAsync() {
 	go func() {
 		_ = syncLocalMusicIndex()
 	}()
+}
+
+// reconcileDownloadDedupWithScan 用一次全量扫盘结果对账下载去重索引。keep 之外的
+// 歌说明磁盘上已经没有文件，对应记录会被回收；路径有变化的会被更新。
+//
+// 只在扫描到至少一个音频文件时才动去重索引：下载目录被整个清空（或挂载点掉了）
+// 时宁可保守，避免一次性清光下载去重记录。
+func reconcileDownloadDedupWithScan(tracks []*localMusicTrack, outDir string) {
+	if len(tracks) == 0 {
+		return
+	}
+	keep := make(map[string]string, len(tracks))
+	for _, track := range tracks {
+		if track == nil {
+			continue
+		}
+		keep[core.SongKey(&model.Song{Name: track.Name, Artist: track.Artist})] = track.RelPath
+	}
+	_, _ = core.PruneDownloadDedup(outDir, keep)
+}
+
+// resolveLegacyDedupForSong 处理没有记录文件路径的旧去重记录：拿歌名+歌手去本地曲库
+// 索引反查，确认真实文件还在不在。查不到就回收记录（这次下载不再被跳过），查到就
+// 把路径补回去，后续判定可以直接走文件校验。
+func resolveLegacyDedupForSong(index core.DownloadDedupIndex, song *model.Song) {
+	if index == nil || song == nil {
+		return
+	}
+	key := core.SongKey(song)
+	relPath, exists := index[key]
+	if !exists || strings.TrimSpace(relPath) != "" {
+		return
+	}
+
+	if row, _, err := findLocalMusicMatch(song.Name, song.Artist); err != nil {
+		return
+	} else if row != nil &&
+		strings.EqualFold(strings.TrimSpace(row.Name), strings.TrimSpace(song.Name)) &&
+		strings.EqualFold(strings.TrimSpace(row.Artist), strings.TrimSpace(song.Artist)) {
+		index[key] = row.RelPath
+		_ = core.SaveDownloadDedupEntry(song.Name, song.Artist, row.RelPath)
+		return
+	}
+
+	tracks, _, dirExists, err, _, _ := scanLocalMusicTracksCached(true)
+	if err != nil || !dirExists {
+		return
+	}
+
+	var match *localMusicTrack
+	for _, track := range tracks {
+		if track == nil {
+			continue
+		}
+		if strings.EqualFold(strings.TrimSpace(track.Name), strings.TrimSpace(song.Name)) &&
+			strings.EqualFold(strings.TrimSpace(track.Artist), strings.TrimSpace(song.Artist)) {
+			match = track
+			break
+		}
+	}
+	if match == nil {
+		_ = core.ForgetDownloadedSong(song.Name, song.Artist, "")
+		delete(index, key)
+		return
+	}
+
+	index[key] = match.RelPath
+	_ = core.SaveDownloadDedupEntry(song.Name, song.Artist, match.RelPath)
 }
 
 // loadTracksFromIndex 从 SQLite 索引表分页读取本地音乐，不走文件系统 IO。
@@ -144,30 +294,17 @@ func loadTracksFromIndex(offset int, limit int) ([]*localMusicTrack, int, bool) 
 	for i := range rows {
 		row := &rows[i]
 		// 快速校验文件是否还在磁盘上
-		absPath := filepath.Join(rootAbs, filepath.FromSlash(row.RelPath))
+		track := localMusicTrackFromIndexRow(rootAbs, row)
+		if track == nil {
+			missingIDs = append(missingIDs, row.ID)
+			continue
+		}
+		absPath := track.absPath
 		if info, statErr := os.Stat(absPath); statErr != nil || info.IsDir() {
 			missingIDs = append(missingIDs, row.ID)
 			continue
 		}
-		cover := row.Cover
-		if cover == "" && row.HasCover {
-			cover = RoutePrefix + "/local_music/cover?id=" + url.QueryEscape(row.ID)
-		}
-		tracks = append(tracks, &localMusicTrack{
-			ID:       row.ID,
-			Source:   localMusicSource,
-			Name:     row.Name,
-			Artist:   row.Artist,
-			Album:    row.Album,
-			Cover:    cover,
-			Duration: row.Duration,
-			Filename: filepath.Base(row.RelPath),
-			RelPath:  row.RelPath,
-			Ext:      row.Ext,
-			Size:     row.Size,
-			SizeText: formatSizeForIndex(row.Size),
-			Extra:    localMusicIndexExtra(row),
-		})
+		tracks = append(tracks, track)
 	}
 	if len(missingIDs) > 0 {
 		if err := db.Where("id IN ?", missingIDs).Delete(&LocalMusicIndex{}).Error; err != nil {

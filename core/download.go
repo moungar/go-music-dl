@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/guohuiyuan/music-lib/migu"
 	"github.com/guohuiyuan/music-lib/model"
 	"github.com/guohuiyuan/music-lib/soda"
 	"github.com/guohuiyuan/music-lib/utils"
@@ -116,11 +117,7 @@ func saveDownloadedSongToFile(result *DownloadedSong, outDir string) (*Downloade
 		return nil, errors.New("download result is nil")
 	}
 
-	targetDir := strings.TrimSpace(outDir)
-	if targetDir == "" {
-		targetDir = DefaultWebDownloadDir
-	}
-	targetDir = filepath.Clean(targetDir)
+	targetDir := DownloadDirOrDefault(outDir)
 
 	if err := os.MkdirAll(targetDir, 0755); err != nil {
 		return nil, err
@@ -131,7 +128,30 @@ func saveDownloadedSongToFile(result *DownloadedSong, outDir string) (*Downloade
 	if err := os.MkdirAll(filepath.Dir(filePath), 0755); err != nil {
 		return nil, err
 	}
-	if err := os.WriteFile(filePath, result.Data, 0644); err != nil {
+	// Commit only a complete file. A killed download must not leave a partial
+	// audio file that a later local-library scan could mistake for a success.
+	temporary, err := os.CreateTemp(filepath.Dir(filePath), ".musicdl-*.part")
+	if err != nil {
+		return nil, err
+	}
+	temporaryPath := temporary.Name()
+	defer func() { _ = os.Remove(temporaryPath) }()
+	if _, err = temporary.Write(result.Data); err != nil {
+		_ = temporary.Close()
+		return nil, err
+	}
+	if err = temporary.Chmod(0644); err != nil {
+		_ = temporary.Close()
+		return nil, err
+	}
+	if err = temporary.Sync(); err != nil {
+		_ = temporary.Close()
+		return nil, err
+	}
+	if err = temporary.Close(); err != nil {
+		return nil, err
+	}
+	if err = os.Rename(temporaryPath, filePath); err != nil {
 		return nil, err
 	}
 
@@ -153,6 +173,9 @@ func BuildDownloadFilename(song *model.Song, ext string, filenameTemplate string
 	source := ""
 	id := ""
 	if song != nil {
+		if GetWebSettings().NormalizeChineseVariants {
+			song = NormalizeSongForDownload(song)
+		}
 		if strings.TrimSpace(song.Name) != "" {
 			name = strings.TrimSpace(song.Name)
 		}
@@ -230,7 +253,7 @@ func sanitizeDownloadPathSegment(value string) string {
 // FetchDecryptedSodaAudio 下载并解密 soda（汽水）加密音频流，返回明文音频字节。
 func FetchDecryptedSodaAudio(song *model.Song) ([]byte, error) {
 	cookie := CM.Get("soda")
-	sodaInst := soda.New(cookie)
+	sodaInst := NewSodaClient(cookie)
 	info, err := sodaInst.GetDownloadInfo(song)
 	if err != nil {
 		return nil, err
@@ -241,12 +264,47 @@ func FetchDecryptedSodaAudio(song *model.Song) ([]byte, error) {
 		return nil, err
 	}
 
+	// 汽水 SEO 路径返回明文 m4a（无 play_auth），只需下载无需解密。
+	if strings.TrimSpace(info.PlayAuth) == "" {
+		return encryptedData, nil
+	}
 	return soda.DecryptAudio(encryptedData, info.PlayAuth)
+}
+
+// FetchDecryptedMiguAudio downloads a Migu stream and decrypts Z3D output.
+func FetchDecryptedMiguAudio(song *model.Song) ([]byte, error) {
+	miguInst := migu.New(CM.Get("migu"))
+	info, err := miguInst.GetDownloadInfo(song)
+	if err != nil {
+		return nil, err
+	}
+	return fetchMiguAudio(info)
+}
+
+func fetchMiguAudio(info *migu.DownloadInfo) ([]byte, error) {
+	if info == nil {
+		return nil, errors.New("migu download info is nil")
+	}
+	fileData, _, err := FetchBytesWithMime(info.URL, "migu")
+	if err != nil {
+		return nil, err
+	}
+	if !info.Encrypted {
+		return fileData, nil
+	}
+	return migu.DecryptAudio(fileData, info.FileKey)
 }
 
 func fetchSongAudio(song *model.Song) ([]byte, string, error) {
 	if song.Source == "soda" {
 		finalData, err := FetchDecryptedSodaAudio(song)
+		if err != nil {
+			return nil, "", err
+		}
+		return finalData, "", nil
+	}
+	if song.Source == "migu" {
+		finalData, err := FetchDecryptedMiguAudio(song)
 		if err != nil {
 			return nil, "", err
 		}

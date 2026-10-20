@@ -10,9 +10,235 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/guohuiyuan/go-music-dl/core"
+	"github.com/guohuiyuan/music-lib/model"
 )
+
+// 扫盘对账：本地已经没有文件的歌，去重记录要一并回收，否则再下载会被判成「已下载」。
+func TestReconcileDownloadDedupWithScanDropsMissingTracks(t *testing.T) {
+	initCollectionDBForTest(t)
+
+	keepSong := &model.Song{Name: "Keep", Artist: "Artist"}
+	dropSong := &model.Song{Name: "Drop", Artist: "Artist"}
+	if err := core.SaveDownloadDedupEntry(keepSong.Name, keepSong.Artist, "Artist - Keep.flac"); err != nil {
+		t.Fatalf("seed keep entry: %v", err)
+	}
+	if err := core.SaveDownloadDedupEntry(dropSong.Name, dropSong.Artist, "Artist - Drop.flac"); err != nil {
+		t.Fatalf("seed drop entry: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = core.ForgetDownloadedSong(keepSong.Name, keepSong.Artist, "Artist - Keep.flac")
+		_ = core.ForgetDownloadedSong(dropSong.Name, dropSong.Artist, "Artist - Drop.flac")
+	})
+
+	reconcileDownloadDedupWithScan([]*localMusicTrack{
+		{Name: "Keep", Artist: "Artist", RelPath: "Artist - Keep.flac"},
+	}, t.TempDir())
+
+	index, err := core.LoadDownloadDedupSet()
+	if err != nil {
+		t.Fatalf("LoadDownloadDedupSet: %v", err)
+	}
+	if !core.IsSongDownloaded(keepSong, index) {
+		t.Fatal("文件还在本地，去重记录不该被回收")
+	}
+	if core.IsSongDownloaded(dropSong, index) {
+		t.Fatal("文件已不在本地，去重记录应当被回收")
+	}
+}
+
+// 扫描结果为空（下载目录未挂载或目录被清空）时必须保守，不能清空去重索引。
+func TestReconcileDownloadDedupWithScanKeepsEntriesWhenScanIsEmpty(t *testing.T) {
+	initCollectionDBForTest(t)
+
+	song := &model.Song{Name: "Keep", Artist: "Artist"}
+	if err := core.SaveDownloadDedupEntry(song.Name, song.Artist, "Artist - Keep.flac"); err != nil {
+		t.Fatalf("seed entry: %v", err)
+	}
+	t.Cleanup(func() { _ = core.ForgetDownloadedSong(song.Name, song.Artist, "Artist - Keep.flac") })
+
+	reconcileDownloadDedupWithScan(nil, t.TempDir())
+
+	index, err := core.LoadDownloadDedupSet()
+	if err != nil {
+		t.Fatalf("LoadDownloadDedupSet: %v", err)
+	}
+	if !core.IsSongDownloaded(song, index) {
+		t.Fatal("空扫描结果时不应回收任何去重记录")
+	}
+}
+
+// 旧去重记录没有文件路径：磁盘上已经没有这首歌时，下载前要把它清掉。
+func TestResolveLegacyDedupForSongForgetsMissingFile(t *testing.T) {
+	initCollectionDBForTest(t)
+
+	downloadDir := t.TempDir()
+	withLocalMusicDownloadDir(t, downloadDir)
+
+	song := &model.Song{Name: "Gone", Artist: "Artist"}
+	// 索引里还留着这首歌的行（还没被扫盘清掉），但文件确实不在磁盘上。
+	if err := db.Create(&LocalMusicIndex{ID: encodeLocalMusicID("Gone.mp3"), RelPath: "Gone.mp3", Name: "Gone", Artist: "Artist"}).Error; err != nil {
+		t.Fatalf("seed index row: %v", err)
+	}
+	if err := core.SaveDownloadDedupEntry(song.Name, song.Artist, ""); err != nil {
+		t.Fatalf("seed legacy dedup entry: %v", err)
+	}
+	t.Cleanup(func() { _ = core.ForgetDownloadedSong(song.Name, song.Artist, "") })
+
+	index, err := core.LoadDownloadDedupSet()
+	if err != nil {
+		t.Fatalf("LoadDownloadDedupSet: %v", err)
+	}
+	if !core.IsSongDownloaded(song, index) {
+		t.Fatal("前置条件：旧记录应当先能被命中")
+	}
+
+	resolveLegacyDedupForSong(index, song)
+
+	if core.IsSongDownloaded(song, index) {
+		t.Fatal("文件已不在磁盘上，旧去重记录应被回收")
+	}
+	reloaded, err := core.LoadDownloadDedupSet()
+	if err != nil {
+		t.Fatalf("LoadDownloadDedupSet after resolve: %v", err)
+	}
+	if core.IsSongDownloaded(song, reloaded) {
+		t.Fatal("回收结果需要写回数据库，不能只改内存")
+	}
+}
+
+// 全量扫描已经把旧索引行清空时，也必须能判断旧去重记录对应的文件已经不在
+// 下载目录里。否则当下载目录只剩这一首歌时，删除文件后仍会一直「跳过」。
+func TestResolveLegacyDedupForSongForgetsMissingFileWhenIndexWasSwept(t *testing.T) {
+	initCollectionDBForTest(t)
+
+	withLocalMusicDownloadDir(t, t.TempDir())
+
+	song := &model.Song{Name: "Gone", Artist: "Artist"}
+	if err := core.SaveDownloadDedupEntry(song.Name, song.Artist, ""); err != nil {
+		t.Fatalf("seed legacy dedup entry: %v", err)
+	}
+	t.Cleanup(func() { _ = core.ForgetDownloadedSong(song.Name, song.Artist, "") })
+
+	index, err := core.LoadDownloadDedupSet()
+	if err != nil {
+		t.Fatalf("LoadDownloadDedupSet: %v", err)
+	}
+	if !core.IsSongDownloaded(song, index) {
+		t.Fatal("前置条件：旧记录应当先能被命中")
+	}
+
+	resolveLegacyDedupForSong(index, song)
+
+	if core.IsSongDownloaded(song, index) {
+		t.Fatal("扫描已确认下载目录为空，旧去重记录不能被保留")
+	}
+}
+
+// 下载目录整体不可用时不能把旧记录当成文件已删除，否则 NAS 挂载恢复后会
+// 重复下载整批歌曲。
+func TestResolveLegacyDedupForSongKeepsEntryWhenDownloadDirMissing(t *testing.T) {
+	initCollectionDBForTest(t)
+
+	withLocalMusicDownloadDir(t, filepath.Join(t.TempDir(), "missing"))
+
+	song := &model.Song{Name: "Keep", Artist: "Artist"}
+	if err := core.SaveDownloadDedupEntry(song.Name, song.Artist, ""); err != nil {
+		t.Fatalf("seed legacy dedup entry: %v", err)
+	}
+	t.Cleanup(func() { _ = core.ForgetDownloadedSong(song.Name, song.Artist, "") })
+
+	index, err := core.LoadDownloadDedupSet()
+	if err != nil {
+		t.Fatalf("LoadDownloadDedupSet: %v", err)
+	}
+
+	resolveLegacyDedupForSong(index, song)
+
+	if !core.IsSongDownloaded(song, index) {
+		t.Fatal("下载目录不存在时必须保留旧去重记录")
+	}
+}
+
+// 相似歌名不能代替原歌曲。例如原文件已删除、只剩 Hello (Live) 时，不能把
+// 它回填给旧的 Hello 记录，否则再次下载仍会被误判为“已下载”。
+func TestResolveLegacyDedupForSongDoesNotUseFuzzyTitleMatch(t *testing.T) {
+	initCollectionDBForTest(t)
+
+	downloadDir := t.TempDir()
+	withLocalMusicDownloadDir(t, downloadDir)
+
+	const relPath = "Hello (Live).mp3"
+	if err := os.WriteFile(filepath.Join(downloadDir, relPath), []byte("audio"), 0644); err != nil {
+		t.Fatalf("write local audio: %v", err)
+	}
+	if err := db.Create(&LocalMusicIndex{
+		ID:      encodeLocalMusicID(relPath),
+		RelPath: relPath,
+		Name:    "Hello (Live)",
+		Artist:  "Artist",
+	}).Error; err != nil {
+		t.Fatalf("seed index row: %v", err)
+	}
+
+	song := &model.Song{Name: "Hello", Artist: "Artist"}
+	if err := core.SaveDownloadDedupEntry(song.Name, song.Artist, ""); err != nil {
+		t.Fatalf("seed legacy dedup entry: %v", err)
+	}
+	t.Cleanup(func() { _ = core.ForgetDownloadedSong(song.Name, song.Artist, "") })
+
+	index, err := core.LoadDownloadDedupSet()
+	if err != nil {
+		t.Fatalf("LoadDownloadDedupSet: %v", err)
+	}
+
+	resolveLegacyDedupForSong(index, song)
+
+	if core.IsSongDownloaded(song, index) {
+		t.Fatal("相似歌名的文件不能替代原歌曲的去重记录")
+	}
+}
+
+// 旧去重记录对应的文件还在：顺手把文件路径补回去，后续判定直接走磁盘校验。
+func TestResolveLegacyDedupForSongBackfillsRelPath(t *testing.T) {
+	initCollectionDBForTest(t)
+
+	downloadDir := t.TempDir()
+	withLocalMusicDownloadDir(t, downloadDir)
+
+	if err := os.WriteFile(filepath.Join(downloadDir, "Here.mp3"), []byte("audio"), 0644); err != nil {
+		t.Fatalf("write local audio: %v", err)
+	}
+
+	song := &model.Song{Name: "Here", Artist: "Artist"}
+	if err := db.Create(&LocalMusicIndex{ID: encodeLocalMusicID("Here.mp3"), RelPath: "Here.mp3", Name: "Here", Artist: "Artist"}).Error; err != nil {
+		t.Fatalf("seed index row: %v", err)
+	}
+	if err := core.SaveDownloadDedupEntry(song.Name, song.Artist, ""); err != nil {
+		t.Fatalf("seed legacy dedup entry: %v", err)
+	}
+	t.Cleanup(func() { _ = core.ForgetDownloadedSong(song.Name, song.Artist, "Here.mp3") })
+
+	index, err := core.LoadDownloadDedupSet()
+	if err != nil {
+		t.Fatalf("LoadDownloadDedupSet: %v", err)
+	}
+
+	resolveLegacyDedupForSong(index, song)
+
+	if got := core.SongFileRelPath(song, index); got != "Here.mp3" {
+		t.Fatalf("SongFileRelPath = %q, want %q", got, "Here.mp3")
+	}
+	reloaded, err := core.LoadDownloadDedupSet()
+	if err != nil {
+		t.Fatalf("LoadDownloadDedupSet after resolve: %v", err)
+	}
+	if got := core.SongFileRelPath(song, reloaded); got != "Here.mp3" {
+		t.Fatalf("补回的文件路径需要写进数据库，got %q", got)
+	}
+}
 
 func TestLocalMusicIndexSyncUpsertsAndSweeps(t *testing.T) {
 	initCollectionDBForTest(t)
@@ -58,6 +284,98 @@ func TestLocalMusicIndexSyncUpsertsAndSweeps(t *testing.T) {
 	if dropCount != 0 {
 		t.Fatalf("swept row still present for %s", dropID)
 	}
+}
+
+func TestHydrateLocalMusicMetaCacheReusesPersistedMetadata(t *testing.T) {
+	initCollectionDBForTest(t)
+
+	downloadDir := t.TempDir()
+	withLocalMusicDownloadDir(t, downloadDir)
+	audioPath := filepath.Join(downloadDir, "Indexed Song.mp3")
+	if err := os.WriteFile(audioPath, []byte("not a real audio tag"), 0644); err != nil {
+		t.Fatalf("write audio: %v", err)
+	}
+	info, err := os.Stat(audioPath)
+	if err != nil {
+		t.Fatalf("stat audio: %v", err)
+	}
+
+	const relPath = "Indexed Song.mp3"
+	row := LocalMusicIndex{
+		ID:       encodeLocalMusicID(relPath),
+		RelPath:  relPath,
+		Name:     "Persisted Title",
+		Artist:   "Persisted Artist",
+		Album:    "Persisted Album",
+		Duration: 123,
+		Size:     info.Size(),
+		Ext:      "mp3",
+		ModTime:  info.ModTime(),
+	}
+	if err := db.Create(&row).Error; err != nil {
+		t.Fatalf("seed index row: %v", err)
+	}
+
+	rootAbs, err := filepath.Abs(downloadDir)
+	if err != nil {
+		t.Fatalf("resolve download dir: %v", err)
+	}
+	hydrateLocalMusicMetaCacheFromIndex(rootAbs)
+
+	cached := getCachedLocalMusicTrack(rootAbs, relPath, info.Size(), info.ModTime())
+	if cached == nil {
+		t.Fatal("persisted index row was not loaded into the metadata cache")
+	}
+	if cached.Name != row.Name || cached.Artist != row.Artist || cached.Duration != row.Duration {
+		t.Fatalf("cached track = %+v, want persisted metadata", cached)
+	}
+
+	track, err := buildLocalMusicTrackFast(rootAbs, audioPath)
+	if err != nil {
+		t.Fatalf("build track from cache: %v", err)
+	}
+	if track.Name != row.Name || track.Duration != row.Duration {
+		t.Fatalf("fast track = %+v, want persisted metadata", track)
+	}
+}
+
+func TestRefreshLocalMusicScanAsyncIfStaleRespectsTTL(t *testing.T) {
+	initCollectionDBForTest(t)
+
+	downloadDir := t.TempDir()
+	withLocalMusicDownloadDir(t, downloadDir)
+	storeLocalMusicScanSnapshot(localMusicScanSnapshot{
+		Dir:       downloadDir,
+		Exists:    true,
+		ScannedAt: time.Now(),
+	})
+
+	if refreshLocalMusicScanAsyncIfStale(downloadDir) {
+		t.Fatal("fresh scan snapshot should not start another full scan")
+	}
+	localMusicScanRefreshMu.Lock()
+	refreshing := localMusicScanRefreshInFlight
+	localMusicScanRefreshMu.Unlock()
+	if refreshing {
+		t.Fatal("fresh scan snapshot left a refresh running")
+	}
+}
+
+func TestRefreshLocalMusicScanAsyncIfStaleStartsStaleScan(t *testing.T) {
+	initCollectionDBForTest(t)
+
+	downloadDir := t.TempDir()
+	withLocalMusicDownloadDir(t, downloadDir)
+	storeLocalMusicScanSnapshot(localMusicScanSnapshot{
+		Dir:       downloadDir,
+		Exists:    true,
+		ScannedAt: time.Now().Add(-localMusicScanCacheTTL - time.Second),
+	})
+
+	if !refreshLocalMusicScanAsyncIfStale(downloadDir) {
+		t.Fatal("stale scan snapshot should start a refresh")
+	}
+	waitForLocalMusicScanRefresh(t)
 }
 
 func TestLoadTracksFromIndexDropsStaleRowsAndCorrectsTotal(t *testing.T) {
