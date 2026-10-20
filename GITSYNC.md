@@ -72,3 +72,8 @@ git push origin main
 1. **永远不要 `git push upstream`**：只推 `origin`，这样你的代码就永远只进你自己的空间。
 2. **VS Code 的“同步”按钮**：VS Code 左下角的同步按钮（上下箭头）默认只针对 `origin`。如果你用终端敲了 `git merge upstream/main` 并解决了冲突，直接点 VS Code 的同步按钮也是可以的，效果等于 `git push origin main`。
 3. **如果不小心合并乱了想重来**：在第四阶段推送之前，随时可以执行 `git merge --abort` 放弃这次合并，回到合并前的状态。
+
+---
+### 终极心法：
+ - origin = 你的仓库：只用来 push（推代码），或者 pull（拉取你自己在其他电脑上的修改）。
+ - upstream = 原作者的仓库：只用来 fetch（看更新）和 merge（合并更新），永远不要对它使用 push。
