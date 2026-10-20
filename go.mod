@@ -1,6 +1,6 @@
 module github.com/guohuiyuan/go-music-dl
 
-go 1.25.1
+go 1.24.0
 
 require (
 	gioui.org v0.9.1-0.20251215212054-7bcb315ee174
